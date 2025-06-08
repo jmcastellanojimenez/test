@@ -1,0 +1,36 @@
+name: Test AWS Connection
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # This allows manual triggering
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read    # Required to checkout code
+
+jobs:
+  test-aws-connection:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        aws-region: ${{ secrets.AWS_REGION }}
+        role-session-name: GitHubActions-Test
+
+    - name: Test AWS connection
+      run: |
+        echo "Testing AWS connection..."
+        aws sts get-caller-identity
+        echo "SUCCESS: Connected to AWS!"
+        
+    - name: List S3 buckets (optional test)
+      run: |
+        echo "Listing S3 buckets to verify permissions..."
+        aws s3 ls || echo "No S3 access or no buckets found"
