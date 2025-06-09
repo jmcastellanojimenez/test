@@ -10,6 +10,8 @@ export class eksNodegroupCreation {
     private nodeGroup!: EksNodegroup;
 
     public instanceTypeMap: Record<string, string> = {
+        NANO: "t3.nano",
+        NANO_G: "t4g.nano",
         XS: "t3.micro",
         S: "t3.medium",
         M: "m6a.xlarge",
@@ -31,7 +33,7 @@ export class eksNodegroupCreation {
         for (let i = 0; i < nodegroups.length; i++) {
             const nodegroup = nodegroups[i];
 
-            const instanceType = this.instanceTypeMap[nodegroup.nodeSize] ?? "m6a.large";
+            const instanceType = this.instanceTypeMap[nodegroup.nodeSize] ?? "t3.micro";
 
             const preBootstrapUserData = `#!/bin/bash
             set -ex
