@@ -1,7 +1,7 @@
 {
   "stackName": "ekscdktf",
   "account": "011921741593",
-  "region": "eu-central-1",
+  "region": "us-east-1",
   "tags": {
     "environment": "Production",
     "project": "alpha"
