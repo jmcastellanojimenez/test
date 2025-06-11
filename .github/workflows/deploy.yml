@@ -1,0 +1,411 @@
+name: Deploy EKS Infrastructure
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: 'Cluster configuration to deploy'
+        required: true
+        type: choice
+        options:
+          - 'p-alpha-eks-01'
+          - 'np-alpha-eks-01'
+          - 'np-alpha-eks-02'
+          - 'lab-alpha-eks-01'
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - 'plan'
+          - 'deploy'
+          - 'destroy'
+        default: 'plan'
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - 'production'
+          - 'nonprod'
+          - 'sandbox'
+
+env:
+  NODE_VERSION: '18'
+  TERRAFORM_VERSION: '1.5.0'
+  CDKTF_VERSION: '0.20.12'
+
+jobs:
+  validate:
+    name: Validate Configuration
+    runs-on: ubuntu-latest
+    outputs:
+      cluster: ${{ steps.config.outputs.cluster }}
+      environment: ${{ steps.config.outputs.environment }}
+      region: ${{ steps.config.outputs.region }}
+      account: ${{ steps.config.outputs.account }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: cdktf/package-lock.json
+    
+    - name: Determine cluster configuration
+      id: config
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          CLUSTER="${{ github.event.inputs.cluster }}"
+          ENVIRONMENT="${{ github.event.inputs.environment }}"
+        else
+          # Auto-determine based on branch
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            CLUSTER="p-alpha-eks-01"
+            ENVIRONMENT="production"
+          else
+            CLUSTER="np-alpha-eks-01"
+            ENVIRONMENT="nonprod"
+          fi
+        fi
+        
+        echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
+        echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+        
+        # Extract region and account from config file
+        CONFIG_PATH="cdktf/config"
+        if [[ "$CLUSTER" == p-* ]]; then
+          CONFIG_FILE="$CONFIG_PATH/prod/$CLUSTER.json"
+        elif [[ "$CLUSTER" == np-* ]]; then
+          CONFIG_FILE="$CONFIG_PATH/nonprod/$CLUSTER.json"
+        elif [[ "$CLUSTER" == lab-* ]]; then
+          CONFIG_FILE="$CONFIG_PATH/sandbox/$CLUSTER.json"
+        fi
+        
+        REGION=$(jq -r '.region' "$CONFIG_FILE")
+        ACCOUNT=$(jq -r '.account' "$CONFIG_FILE")
+        
+        echo "region=$REGION" >> $GITHUB_OUTPUT
+        echo "account=$ACCOUNT" >> $GITHUB_OUTPUT
+        
+        echo "Deploying cluster: $CLUSTER"
+        echo "Environment: $ENVIRONMENT"
+        echo "Region: $REGION"
+        echo "Account: $ACCOUNT"
+    
+    - name: Install dependencies
+      working-directory: cdktf
+      run: |
+        npm ci
+        npm run get
+    
+    - name: Validate TypeScript
+      working-directory: cdktf
+      run: |
+        npm run compile
+    
+    - name: Validate configuration files
+      run: |
+        # Validate JSON config files
+        for config in cdktf/config/*/*.json; do
+          echo "Validating $config"
+          jq empty "$config" || exit 1
+        done
+
+  plan:
+    name: Plan Infrastructure Changes
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
+    environment: ${{ needs.validate.outputs.environment }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: cdktf/package-lock.json
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TERRAFORM_VERSION }}
+        terraform_wrapper: false
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ needs.validate.outputs.region }}
+        mask-aws-account-id: false
+    
+    - name: Verify AWS account
+      run: |
+        CURRENT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+        EXPECTED_ACCOUNT="${{ needs.validate.outputs.account }}"
+        
+        if [ "$CURRENT_ACCOUNT" != "$EXPECTED_ACCOUNT" ]; then
+          echo "ERROR: AWS account mismatch!"
+          echo "Current account: $CURRENT_ACCOUNT"
+          echo "Expected account: $EXPECTED_ACCOUNT"
+          exit 1
+        fi
+        
+        echo "✅ AWS account verified: $CURRENT_ACCOUNT"
+    
+    - name: Install dependencies
+      working-directory: cdktf
+      run: |
+        npm ci
+        npm run get
+    
+    - name: Create Terraform backend resources
+      working-directory: backend
+      env:
+        AWS_REGION: ${{ needs.validate.outputs.region }}
+        ENV: ${{ needs.validate.outputs.environment == 'production' && 'p' || 'np' }}
+        PROJECT: alpha
+      run: |
+        # Check if S3 bucket exists
+        if aws s3 ls "s3://tf-bucket-$ENV-$PROJECT" 2>/dev/null; then
+          echo "Backend resources already exist"
+        else
+          echo "Creating backend resources..."
+          ./tf-backend-resources.sh
+        fi
+    
+    - name: Synthesize Terraform code
+      working-directory: cdktf
+      env:
+        CLUSTER: ${{ needs.validate.outputs.cluster }}
+        VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+      run: |
+        npm run synth
+    
+    - name: Plan infrastructure changes
+      working-directory: cdktf
+      env:
+        CLUSTER: ${{ needs.validate.outputs.cluster }}
+        VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+      run: |
+        npm run diff > plan_output.txt 2>&1 || true
+        
+        # Create summary for PR comment
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          {
+            echo "## 🏗️ Infrastructure Plan for \`$CLUSTER\`"
+            echo ""
+            echo "**Environment:** ${{ needs.validate.outputs.environment }}"
+            echo "**Region:** ${{ needs.validate.outputs.region }}"
+            echo "**Account:** ${{ needs.validate.outputs.account }}"
+            echo ""
+            echo "### Plan Output"
+            echo '```'
+            cat plan_output.txt
+            echo '```'
+          } > plan_summary.md
+        fi
+    
+    - name: Comment PR with plan
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      env:
+        PLAN_SUMMARY: ${{ format('{0}', 'plan_summary.md') }}
+      with:
+        script: |
+          const fs = require('fs');
+          const planSummary = fs.readFileSync('cdktf/plan_summary.md', 'utf8');
+          
+          // Find existing comment
+          const comments = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+          
+          const existingComment = comments.data.find(comment => 
+            comment.body.includes('🏗️ Infrastructure Plan')
+          );
+          
+          if (existingComment) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existingComment.id,
+              body: planSummary
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: planSummary
+            });
+          }
+
+  deploy:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: validate
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'deploy')
+    environment: ${{ needs.validate.outputs.environment }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: cdktf/package-lock.json
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TERRAFORM_VERSION }}
+        terraform_wrapper: false
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ needs.validate.outputs.region }}
+        mask-aws-account-id: false
+    
+    - name: Verify AWS account
+      run: |
+        CURRENT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+        EXPECTED_ACCOUNT="${{ needs.validate.outputs.account }}"
+        
+        if [ "$CURRENT_ACCOUNT" != "$EXPECTED_ACCOUNT" ]; then
+          echo "ERROR: AWS account mismatch!"
+          echo "Current account: $CURRENT_ACCOUNT"
+          echo "Expected account: $EXPECTED_ACCOUNT"
+          exit 1
+        fi
+        
+        echo "✅ AWS account verified: $CURRENT_ACCOUNT"
+    
+    - name: Install dependencies
+      working-directory: cdktf
+      run: |
+        npm ci
+        npm run get
+    
+    - name: Create Terraform backend resources
+      working-directory: backend
+      env:
+        AWS_REGION: ${{ needs.validate.outputs.region }}
+        ENV: ${{ needs.validate.outputs.environment == 'production' && 'p' || 'np' }}
+        PROJECT: alpha
+      run: |
+        # Check if S3 bucket exists
+        if aws s3 ls "s3://tf-bucket-$ENV-$PROJECT" 2>/dev/null; then
+          echo "Backend resources already exist"
+        else
+          echo "Creating backend resources..."
+          ./tf-backend-resources.sh
+        fi
+    
+    - name: Deploy infrastructure
+      working-directory: cdktf
+      env:
+        CLUSTER: ${{ needs.validate.outputs.cluster }}
+        VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        AWX_BASE_URL: ${{ secrets.AWX_BASE_URL }}
+        AWX_JOB_TEMPLATE_ID: ${{ secrets.AWX_JOB_TEMPLATE_ID }}
+      run: |
+        npm run deploy --auto-approve
+    
+    - name: Output deployment info
+      run: |
+        echo "🚀 Deployment completed successfully!"
+        echo "Cluster: ${{ needs.validate.outputs.cluster }}"
+        echo "Environment: ${{ needs.validate.outputs.environment }}"
+        echo "Region: ${{ needs.validate.outputs.region }}"
+        echo "Account: ${{ needs.validate.outputs.account }}"
+
+  destroy:
+    name: Destroy Infrastructure
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    environment: ${{ needs.validate.outputs.environment }}-destroy
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: cdktf/package-lock.json
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TERRAFORM_VERSION }}
+        terraform_wrapper: false
+    
+    - name: Configure AWS credentials
+      uses: actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ needs.validate.outputs.region }}
+        mask-aws-account-id: false
+    
+    - name: Verify AWS account
+      run: |
+        CURRENT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+        EXPECTED_ACCOUNT="${{ needs.validate.outputs.account }}"
+        
+        if [ "$CURRENT_ACCOUNT" != "$EXPECTED_ACCOUNT" ]; then
+          echo "ERROR: AWS account mismatch!"
+          echo "Current account: $CURRENT_ACCOUNT"
+          echo "Expected account: $EXPECTED_ACCOUNT"
+          exit 1
+        fi
+        
+        echo "✅ AWS account verified: $CURRENT_ACCOUNT"
+    
+    - name: Install dependencies
+      working-directory: cdktf
+      run: |
+        npm ci
+        npm run get
+    
+    - name: Destroy infrastructure
+      working-directory: cdktf
+      env:
+        CLUSTER: ${{ needs.validate.outputs.cluster }}
+        VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+      run: |
+        echo "⚠️ Destroying infrastructure for cluster: $CLUSTER"
+        npm run destroy --auto-approve
+    
+    - name: Cleanup notification
+      run: |
+        echo "🗑️ Infrastructure destroyed successfully!"
+        echo "Cluster: ${{ needs.validate.outputs.cluster }}"
+        echo "Environment: ${{ needs.validate.outputs.environment }}"
