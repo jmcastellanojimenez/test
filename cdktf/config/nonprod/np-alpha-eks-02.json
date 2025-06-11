@@ -1,20 +1,20 @@
 {
   "stackName": "ekscdktf",
-  "account": "503561447988",
-  "region": "eu-central-1",
+  "account": "011921741593",
+  "region": "us-east-1",
   "tags": {
     "environment": "Non-Production",
     "project": "alpha"
   },
   "projects": {
     "alpha": {
-      "vpcId": "vpc-05be55e03db78dfa8",
+      "vpcId": "vpc-01deec2367e9a8e11",
       "k8sVersion": "1.31",
       "installCilium": false,
       "nodegroups": [
         {
           "nodeName": "default",
-          "nodeSize": "M",
+          "nodeSize": "NANO",
           "maxNumberNodes": 4,
           "desireNumberNodes": 3
         }
